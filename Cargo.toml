@@ -1,0 +1,15 @@
+[package]
+name = "video_cutter"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.57"
+crossbeam-channel = "0.5.4"
+eframe = "0.18.0"
+egui_extras = "0.18.0"
+minreq = "2.6.0"
+parking_lot = "0.12.1"
+winsafe = { version = "0.0.10", features = ["user", "shell"] }

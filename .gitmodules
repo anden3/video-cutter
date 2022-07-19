@@ -1,0 +1,3 @@
+[submodule "tools/msvc-linker"]
+	path = tools/msvc-linker
+	url = https://github.com/strickczq/msvc-wsl-rust
