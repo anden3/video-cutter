@@ -8,8 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use copypasta::ClipboardProvider;
 use eframe::{
-    egui::{self, Id, Key, PointerButton, ProgressBar, Sense, TextEdit, Widget},
+    egui::{self, Button, Id, Key, PointerButton, ProgressBar, Sense, TextEdit, Widget},
     emath::{Rect, Vec2},
     epaint::{Color32, Stroke},
 };
@@ -373,6 +374,10 @@ impl Gui {
                 });
                 header.col(|ui| {
                     ui.heading("Label");
+
+                    ui.with_layout(egui::Layout::right_to_left(), |ui| {
+                        self.draw_clipboard_buttons(ui);
+                    });
                 });
             })
             .body(|body| {
@@ -438,6 +443,72 @@ impl Gui {
                     },
                 );
             })
+    }
+
+    fn draw_clipboard_buttons(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !self.segments.is_empty() && self.player_info.is_some(),
+                    Button::new("Copy"),
+                )
+                .clicked()
+            {
+                let current_path = self.player_info.as_ref().unwrap().path.clone();
+
+                let current_segments: Vec<_> = self
+                    .segments
+                    .iter()
+                    .filter(|segment| segment.path == current_path)
+                    .collect();
+
+                let segments = match serde_json::to_string(&current_segments) {
+                    Ok(segments) => segments,
+                    Err(err) => {
+                        eprintln!("Failed to serialize segments: {}", err);
+                        return;
+                    }
+                };
+
+                ui.output().copied_text = segments;
+            }
+
+            let clipboard_segments: Option<Vec<Segment>> = {
+                let mut clipboard = match copypasta::ClipboardContext::new() {
+                    Ok(clipboard) => clipboard,
+                    Err(err) => {
+                        eprintln!("Failed to get clipboard: {}", err);
+                        return;
+                    }
+                };
+
+                let clipboard_contents = clipboard.get_contents().unwrap_or_default();
+                serde_json::from_str(&clipboard_contents).ok()
+            };
+
+            if ui
+                .add_enabled(
+                    clipboard_segments.is_some() && self.player_info.is_some(),
+                    Button::new("Paste"),
+                )
+                .clicked()
+            {
+                let current_path = self.player_info.as_ref().unwrap().path.clone();
+                let mut new_segments = clipboard_segments.unwrap_or_default();
+
+                for segment in &mut new_segments {
+                    segment.path = current_path.clone();
+                    segment.align_to_keyframes(true, true, &self.keyframes);
+                }
+
+                // Remove old segments associated with this path, and replace with new ones.
+                self.segments.retain(|segment| segment.path != current_path);
+                self.segments.extend(new_segments);
+
+                self.selected_segment = 0;
+                self.partial_segment = None;
+            }
+        });
     }
 
     fn draw_timeline(&mut self, ui: &mut egui::Ui) {

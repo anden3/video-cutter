@@ -7,6 +7,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.57"
+copypasta = "0.8.1"
 crossbeam-channel = "0.5.4"
 eframe = { version = "0.18.0", features = ["persistence"] }
 egui_extras = "0.18.0"
