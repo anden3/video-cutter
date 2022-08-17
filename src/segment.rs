@@ -4,12 +4,14 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
     util,
     video_rpc::{send_command, PlayerCmd},
 };
 
-#[derive(Debug, Default, Clone, Eq)]
+#[derive(Debug, Default, Clone, Eq, Serialize, Deserialize)]
 pub struct Segment {
     pub duration: Range<Duration>,
     pub description: String,
@@ -154,7 +156,9 @@ impl Segment {
                     .position(|&k| k == self.duration.end)
                     .unwrap();
 
-                self.duration.start = keyframes[end_idx + 1];
+                if keyframes.len() > end_idx + 1 {
+                    self.duration.end = keyframes[end_idx + 1];
+                }
             }
         }
     }

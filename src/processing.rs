@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -11,6 +12,9 @@ use winsafe::{
     self as w, co,
     prelude::{ShellITaskbarList3, UserHwnd},
 }; */
+
+use anyhow::{anyhow, Context};
+use once_cell::unsync::Lazy;
 
 use crate::{util::format_duration, watch::Sender, Segment};
 
@@ -26,9 +30,28 @@ pub enum ProcessingState {
     },
     CleaningUp,
     Done,
+    Failed,
 }
 
-pub fn extract_keyframes(file: &Path) -> Vec<Duration> {
+pub fn extract_keyframes(file: &Path) -> anyhow::Result<Vec<Duration>> {
+    thread_local! {
+        static KEYFRAME_CACHE: Lazy<RefCell<lru::LruCache<String, Vec<Duration>>>> =
+            Lazy::new(|| RefCell::new(lru::LruCache::new(8)));
+    }
+
+    let file_str = file
+        .to_str()
+        .context("Could not convert file path to string")?;
+
+    let cached_result = KEYFRAME_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.get(file_str).cloned()
+    });
+
+    if let Some(keyframes) = cached_result {
+        return Ok(keyframes);
+    }
+
     let mut cmd = Command::new("ffprobe");
 
     #[cfg(windows)]
@@ -48,16 +71,29 @@ pub fn extract_keyframes(file: &Path) -> Vec<Duration> {
         .args(["-of", r#"csv=p=0:s=\"#])
         .arg(file.to_str().unwrap());
 
-    let output = cmd.output().expect("could not run ffprobe");
+    let output = cmd.output().context("Could not run `ffprobe`")?;
 
-    output
+    let lines = output
         .stdout
         .split(|b| *b == b'\n')
-        .map(|l| std::str::from_utf8(l).unwrap().trim())
+        .map(std::str::from_utf8)
+        .collect::<Result<Vec<_>, _>>()
+        .context("`ffprobe` output contained invalid UTF-8.")?;
+
+    let keyframes: Vec<Duration> = lines
+        .into_iter()
+        .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .filter_map(extract_timestamp)
         .map(parse_duration)
-        .collect()
+        .collect();
+
+    KEYFRAME_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.put(file_str.to_string(), keyframes.clone());
+    });
+
+    Ok(keyframes)
 }
 
 fn extract_timestamp(line: &str) -> Option<&str> {
@@ -85,10 +121,18 @@ fn parse_duration(input: &str) -> Duration {
     Duration::new(seconds as u64, micros * 1000)
 }
 
-pub fn cut_into_segments(file: &Path, segments: &[Segment]) -> Vec<PathBuf> {
-    let directory = file.parent().unwrap();
-    let filename = file.file_stem().and_then(|f| f.to_str()).unwrap();
-    let extension = file.extension().and_then(|e| e.to_str()).unwrap();
+pub fn cut_into_segments(file: &Path, segments: &[Segment]) -> anyhow::Result<Vec<PathBuf>> {
+    let directory = file
+        .parent()
+        .ok_or_else(|| anyhow!("Could not get parent directory"))?;
+    let filename = file
+        .file_stem()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| anyhow!("Could not get filename from path: {}", file.display()))?;
+    let extension = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .ok_or_else(|| anyhow!("Could not get extension from path: {}", file.display()))?;
 
     let segment_names: Vec<_> = (0..segments.len())
         .into_iter()
@@ -133,12 +177,12 @@ pub fn cut_into_segments(file: &Path, segments: &[Segment]) -> Vec<PathBuf> {
 
     let result = command
         .spawn()
-        .unwrap_or_else(|_| panic!("failed to execute process: {:#?}", command));
-    let result = result.wait_with_output().unwrap();
+        .context(format!("Failed to execute process: {:#?}", command))?;
+    let result = result.wait_with_output()?;
 
     if !result.status.success() {
         println!("{:#?}", command);
-        panic!("{}", String::from_utf8_lossy(&result.stderr));
+        return Err(anyhow!("{}", String::from_utf8_lossy(&result.stderr)));
     } else if !result.stderr.is_empty() {
         eprintln!("{}", String::from_utf8_lossy(&result.stderr));
     }
@@ -149,7 +193,7 @@ pub fn cut_into_segments(file: &Path, segments: &[Segment]) -> Vec<PathBuf> {
         .collect::<Vec<_>>();
 
     assert!(segment_names.iter().all(|n| n.exists()));
-    segment_names
+    Ok(segment_names)
 }
 
 pub fn join_segments(
@@ -158,10 +202,16 @@ pub fn join_segments(
     mut reencode: bool,
     estimated_duration: Duration,
     progress_sender: &Sender<ProcessingState>,
-) -> PathBuf {
-    let directory = file.parent().unwrap();
-    let filename = file.file_stem().and_then(|f| f.to_str()).unwrap();
-    let mut extension = file.extension().and_then(|e| e.to_str()).unwrap();
+) -> anyhow::Result<PathBuf> {
+    let directory = file.parent().context("Failed to get parent directory.")?;
+    let filename = file
+        .file_stem()
+        .and_then(|f| f.to_str())
+        .context("Failed to get filename.")?;
+    let mut extension = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .context("Failed to get extension.")?;
 
     let mut command = Command::new("ffmpeg");
 
@@ -175,11 +225,11 @@ pub fn join_segments(
 
     if segment_names.len() > 1 {
         let mut segment_index = File::create(directory.join("segment_index.txt"))
-            .expect("failed to create segment index");
+            .context("Failed to create segment index.")?;
 
         for segment in segment_names {
             writeln!(segment_index, "file '{}'", segment.to_str().unwrap())
-                .expect("failed to write segment index");
+                .context("Failed to write segment index.")?;
         }
 
         command
@@ -196,6 +246,9 @@ pub fn join_segments(
         reencode = true;
     }
 
+    command.args(["-c", "copy"]);
+    command.args(["-map", "0"]);
+
     if reencode {
         command.args(["-c:v", "libx265"]);
         command.args(["-crf", "26"]);
@@ -203,8 +256,6 @@ pub fn join_segments(
         command.args(["-max_muxing_queue_size", "9999"]);
 
         extension = "mp4";
-    } else {
-        command.args(["-c", "copy"]);
     }
 
     let output = format!("{filename}_merged.{extension}");
@@ -218,9 +269,9 @@ pub fn join_segments(
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let process = command
+    let mut process = command
         .spawn()
-        .unwrap_or_else(|_| panic!("failed to execute process: {:#?}", command));
+        .context(format!("Failed to execute process: {:#?}", command))?;
 
     let mut line = String::new();
 
@@ -230,7 +281,7 @@ pub fn join_segments(
         .create(true)
         .truncate(true)
         .open(directory.join("progress.txt"))
-        .unwrap();
+        .context("Failed to create progress file.")?;
 
     let mut pos = 0;
     let mut reader = BufReader::new(progress_file);
@@ -254,6 +305,14 @@ pub fn join_segments(
     .unwrap(); */
 
     loop {
+        if progress_sender.receiver_count() == 0 {
+            if let Err(e) = process.kill() {
+                eprintln!("Failed to kill process: {}", e);
+            }
+
+            return Err(anyhow!("Processing cancelled."));
+        }
+
         let resp = reader.read_line(&mut line);
 
         match resp {
@@ -264,7 +323,9 @@ pub fn join_segments(
                 }
 
                 std::thread::sleep(Duration::from_millis(500));
-                reader.seek(SeekFrom::Start(pos)).unwrap();
+                reader
+                    .seek(SeekFrom::Start(pos))
+                    .context("Failed to seek.")?;
 
                 frame_time = None;
                 encode_speed = None;
@@ -350,11 +411,25 @@ pub fn join_segments(
     /* #[cfg(windows)]
     w::CoUninitialize(); */
 
-    let result = process.wait_with_output().unwrap();
+    let result = process
+        .wait_with_output()
+        .context("Failed to wait for process.")?;
 
     if !result.status.success() {
-        println!("{:#?}", command);
-        panic!("{}", String::from_utf8_lossy(&result.stderr));
+        println!(
+            "{} {}",
+            command.get_program().to_string_lossy(),
+            command
+                .get_args()
+                .map(|a| a.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        return Err(anyhow!(
+            "Failed to encode: {}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        ));
     } else if !result.stderr.is_empty() {
         eprintln!("{}", String::from_utf8_lossy(&result.stderr));
     }
@@ -362,10 +437,10 @@ pub fn join_segments(
     let output = directory.join(&output);
     assert!(output.exists());
 
-    output
+    Ok(output)
 }
 
-pub fn cleanup(file: &Path, segment_names: &[PathBuf], _output: &Path) {
+pub fn cleanup(file: &Path, segment_names: &[PathBuf]) {
     let directory = file.parent().unwrap();
     let progress_file = directory.join("progress.txt");
 
@@ -390,17 +465,11 @@ pub fn cleanup(file: &Path, segment_names: &[PathBuf], _output: &Path) {
             }
         }
     }
-
-    /* let mut backup = directory.join(file.file_name().unwrap());
-    backup.set_extension(format!("{}.backup", extension));
-
-    std::fs::rename(file, backup).expect("failed to backup original file");
-    std::fs::rename(output, file).expect("failed to rename merged file"); */
 }
 
 fn format_segment(segment: &Segment) -> String {
     let start = format_duration(&segment.duration.start);
     let end = format_duration(&(segment.duration.end - segment.duration.start));
 
-    format!("-ss {start} -t {end} -c copy")
+    format!("-ss {start} -t {end} -c copy -map 0")
 }

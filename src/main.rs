@@ -3,6 +3,7 @@
 
 use std::{
     borrow::Cow,
+    path::PathBuf,
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -17,6 +18,7 @@ use processing::ProcessingState;
 use segment::Segment;
 use util::format_duration;
 use video_rpc::{get_player_info, send_command, PlayerCmd, PlayerInfo};
+use watch::Sender;
 
 mod processing;
 mod segment;
@@ -28,14 +30,14 @@ fn main() {
     std::env::set_var("RUST_BACKTRACE", "1");
 
     let options = eframe::NativeOptions {
-        always_on_top: true,
+        always_on_top: false,
         drag_and_drop_support: false,
-        transparent: true,
+        transparent: false,
         ..Default::default()
     };
 
     eframe::run_native(
-        "Video Cutter Timeline",
+        "Video Cutter",
         options,
         Box::new(|cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
@@ -213,7 +215,7 @@ pub struct Gui {
     player_info_channel: watch::Receiver<Option<PlayerInfo>>,
 
     keyframes: Vec<Duration>,
-    keyframes_thread: Option<JoinHandle<Vec<Duration>>>,
+    keyframes_thread: Option<JoinHandle<anyhow::Result<Vec<Duration>>>>,
 
     processing_updates: Option<watch::Receiver<ProcessingState>>,
 }
@@ -600,8 +602,6 @@ impl Gui {
                 }
             }
         });
-
-        self.draw_bottom_bar(ui);
     }
 
     fn draw_bottom_bar(&mut self, ui: &mut egui::Ui) {
@@ -614,16 +614,20 @@ impl Gui {
                 .get_persisted(Id::new("encoding_enabled"))
                 .unwrap_or(false);
 
-            ui.add_enabled_ui(
-                self.processing_updates.is_none()
-                    && !self.keyframes.is_empty()
-                    && (!self.segments.is_empty() || encoding_enabled),
-                |ui| {
-                    if ui.button("Process").clicked() {
-                        self.process(encoding_enabled);
-                    }
-                },
-            );
+            if self.processing_updates.is_some() {
+                if ui.button("Cancel").clicked() {
+                    self.processing_updates = None;
+                }
+            } else {
+                ui.add_enabled_ui(
+                    !self.keyframes.is_empty() && (!self.segments.is_empty() || encoding_enabled),
+                    |ui| {
+                        if ui.button("Process").clicked() {
+                            self.process(encoding_enabled);
+                        }
+                    },
+                );
+            }
 
             if ui.checkbox(&mut encoding_enabled, "Re-encode").changed() {
                 ui.ctx()
@@ -660,6 +664,10 @@ impl Gui {
                         self.processing_updates = None;
                         (1.00, "Done!".into())
                     }
+                    ProcessingState::Failed => {
+                        self.processing_updates = None;
+                        (1.00, "Failed!".into())
+                    }
                 };
 
                 let percentage = ui.ctx().animate_value_with_time(
@@ -676,7 +684,7 @@ impl Gui {
         });
     }
 
-    fn process(&mut self, mut encode: bool) {
+    fn process(&mut self, encode: bool) {
         let file = if let Some(PlayerInfo { path, .. }) = &self.player_info {
             path.to_owned()
         } else {
@@ -696,37 +704,66 @@ impl Gui {
             self.player_info.as_ref().unwrap().duration
         };
 
-        if !encode && estimated_duration < Duration::from_secs(120) {
-            encode = true;
-        }
-
         let (tx, rx) = watch::channel(ProcessingState::Starting);
         self.processing_updates = Some(rx);
 
         std::thread::spawn(move || {
-            let segment_names = if !segments.is_empty() {
-                tx.send(ProcessingState::Splitting);
-                let names = processing::cut_into_segments(&file, &segments);
+            Self::process_thread(file, segments, encode, tx, estimated_duration);
+        });
+    }
 
-                tx.send(ProcessingState::Merging);
-                names
-            } else {
-                tx.send(ProcessingState::Encoding {
-                    progress: 0.0,
-                    speed: 0.0,
-                    eta: estimated_duration,
-                });
+    fn process_thread(
+        file: PathBuf,
+        segments: Vec<Segment>,
+        encode: bool,
+        tx: Sender<ProcessingState>,
+        estimated_duration: Duration,
+    ) {
+        if tx.receiver_count() == 0 {
+            return;
+        }
 
-                vec![file.clone()]
+        let segment_names = if !segments.is_empty() {
+            tx.send(ProcessingState::Splitting);
+
+            let names = match processing::cut_into_segments(&file, &segments) {
+                Ok(names) => names,
+                Err(e) => {
+                    eprintln!("Failed to split video: {:?}", e);
+                    tx.send(ProcessingState::Failed);
+                    return;
+                }
             };
 
-            let output =
-                processing::join_segments(&file, &segment_names, encode, estimated_duration, &tx);
+            tx.send(ProcessingState::Merging);
+            names
+        } else {
+            tx.send(ProcessingState::Encoding {
+                progress: 0.0,
+                speed: 0.0,
+                eta: estimated_duration,
+            });
 
-            tx.send(ProcessingState::CleaningUp);
-            processing::cleanup(&file, &segment_names, &output);
-            tx.send(ProcessingState::Done);
-        });
+            vec![file.clone()]
+        };
+
+        if tx.receiver_count() == 0 {
+            processing::cleanup(&file, &segment_names);
+            return;
+        }
+
+        if let Err(e) =
+            processing::join_segments(&file, &segment_names, encode, estimated_duration, &tx)
+        {
+            eprintln!("Failed to join segments: {:?}", e);
+            tx.send(ProcessingState::Failed);
+            processing::cleanup(&file, &segment_names);
+            return;
+        }
+
+        tx.send(ProcessingState::CleaningUp);
+        processing::cleanup(&file, &segment_names);
+        tx.send(ProcessingState::Done);
     }
 }
 
@@ -800,7 +837,18 @@ impl eframe::App for Gui {
                 .map_or(false, |thread| thread.is_finished())
             {
                 let thread = self.keyframes_thread.take().unwrap();
-                self.keyframes = thread.join().unwrap();
+
+                self.keyframes = match thread.join() {
+                    Ok(Ok(keyframes)) => keyframes,
+                    Ok(Err(e)) => {
+                        eprintln!("Failed to extract keyframes: {e:?}");
+                        Vec::new()
+                    }
+                    Err(e) => {
+                        eprintln!("Keyframes thread panicked: {e:?}");
+                        Vec::new()
+                    }
+                };
 
                 if let Some(info) = &self.player_info {
                     self.keyframes.push(info.duration);
