@@ -1,7 +1,10 @@
 [package]
 name = "video_cutter"
+authors = ["anden3 <andre.vennberg@gmail.com>"]
 version = "0.1.0"
 edition = "2021"
+repository = "https://github.com/anden3/video-cutter"
+license = "MIT OR Apache-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
