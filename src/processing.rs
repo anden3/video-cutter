@@ -165,6 +165,8 @@ pub fn cut_into_segments(file: &Path, segments: &[Segment]) -> anyhow::Result<Ve
         .args(["-loglevel", "warning"])
         .args(["-i", file.to_str().unwrap()])
         .arg("-y")
+        .args(["-analyzeduration", "100M"])
+        .args(["-probesize", "100M"])
         .args(segments)
         .stderr(Stdio::piped());
 
@@ -221,6 +223,8 @@ pub fn join_segments(
         .args(["-nostats"])
         .args(["-loglevel", "warning"])
         .arg("-y")
+        .args(["-analyzeduration", "100M"])
+        .args(["-probesize", "100M"])
         .args(["-progress", "progress.txt"]);
 
     if segment_names.len() > 1 {
@@ -241,7 +245,10 @@ pub fn join_segments(
             reencode = true;
         }
     } else {
-        command.args(["-i", segment_names[0].to_str().unwrap()]);
+        command
+            .args(["-i", segment_names[0].to_str().unwrap()])
+            .arg("-dn")
+            .args(["-map_metadata", "-1"]);
 
         reencode = true;
     }
@@ -471,5 +478,5 @@ fn format_segment(segment: &Segment) -> String {
     let start = format_duration(&segment.duration.start);
     let end = format_duration(&(segment.duration.end - segment.duration.start));
 
-    format!("-ss {start} -t {end} -c copy -map 0")
+    format!("-ss {start} -t {end} -map 0 -dn -map_metadata -1 -c copy")
 }
