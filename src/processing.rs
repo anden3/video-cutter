@@ -1,5 +1,6 @@
 use std::{
     cell::RefCell,
+    fmt::Display,
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -14,7 +15,9 @@ use winsafe::{
 }; */
 
 use anyhow::{anyhow, Context};
+use eframe::egui;
 use once_cell::unsync::Lazy;
+use strum::{EnumIter, IntoEnumIterator};
 
 use crate::{util::format_duration, watch::Sender, Segment};
 
@@ -31,6 +34,166 @@ pub enum ProcessingState {
     CleaningUp,
     Done,
     Failed,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct TranscodeOptions {
+    encoder: Encoder,
+    quality: u8,
+    preset: &'static str,
+}
+
+impl TranscodeOptions {
+    pub fn config_args(&self) -> impl IntoIterator<Item = &'static str> {
+        self.encoder.config_args().to_vec()
+    }
+
+    pub fn codec_args(&self) -> impl IntoIterator<Item = String> {
+        [
+            "-c:v".to_owned(),
+            self.encoder.to_string(),
+            self.encoder.quality_parameter().to_owned(),
+            self.quality.to_string(),
+            "-preset".to_owned(),
+            self.preset.to_owned(),
+        ]
+    }
+
+    pub fn draw(&mut self, ui: &mut egui::Ui) {
+        ui.label("Encoder");
+
+        let response = egui::ComboBox::from_id_source("Encoder")
+            .selected_text(self.encoder.as_str())
+            .show_ui(ui, |ui| {
+                for encoder in Encoder::iter() {
+                    let response =
+                        ui.selectable_value(&mut self.encoder, encoder, encoder.as_str());
+
+                    if response.clicked() {
+                        return Some(response);
+                    }
+                }
+
+                None
+            });
+
+        if response
+            .inner
+            .flatten()
+            .map(|r| r.clicked())
+            .unwrap_or_default()
+        {
+            self.preset = self.encoder.default_preset();
+        }
+
+        ui.label("Quality");
+
+        ui.add(
+            egui::DragValue::new(&mut self.quality)
+                .prefix(self.encoder.quality_parameter())
+                .clamp_range(0..=30),
+        );
+
+        ui.label("Preset");
+
+        egui::ComboBox::from_id_source("Preset")
+            .selected_text(self.preset)
+            .show_ui(ui, |ui| {
+                for preset in self.encoder.presets() {
+                    ui.selectable_value(&mut self.preset, preset, *preset);
+                }
+            });
+    }
+}
+
+impl Default for TranscodeOptions {
+    fn default() -> Self {
+        Self {
+            encoder: Encoder::HevcNvenc,
+            quality: 24,
+            preset: Encoder::default_preset(&Encoder::HevcNvenc),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, EnumIter)]
+pub enum Encoder {
+    H265,
+    HevcNvenc,
+}
+
+impl Encoder {
+    pub const fn default_preset(&self) -> &'static str {
+        match self {
+            Encoder::H265 => "superfast",
+            Encoder::HevcNvenc => "p4",
+        }
+    }
+
+    pub const fn presets(&self) -> &[&'static str] {
+        match self {
+            Encoder::H265 => &[
+                "ultrafast",
+                "superfast",
+                "veryfast",
+                "faster",
+                "fast",
+                "medium",
+                "slow",
+                "slower",
+                "veryslow",
+            ],
+            Encoder::HevcNvenc => &["p1", "p2", "p3", "p4", "p5", "p6", "p7"],
+        }
+    }
+
+    pub const fn quality_parameter(&self) -> &'static str {
+        match self {
+            Encoder::H265 => "-crf",
+            Encoder::HevcNvenc => "-qp",
+        }
+    }
+
+    pub const fn config_args(&self) -> &[&'static str] {
+        match self {
+            Encoder::H265 => &[],
+            Encoder::HevcNvenc => &[
+                "-threads",
+                "1",
+                "-hwaccel",
+                "cuda",
+                "-hwaccel_output_format",
+                "cuda",
+                "-extra_hw_frames",
+                "16",
+            ],
+        }
+    }
+
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Encoder::H265 => "libx265",
+            Encoder::HevcNvenc => "hevc_nvenc",
+        }
+    }
+}
+
+impl TryFrom<&str> for Encoder {
+    type Error = std::convert::Infallible;
+
+    fn try_from(str: &str) -> Result<Self, Self::Error> {
+        Ok(match str {
+            "libx265" => Encoder::H265,
+            "hevc_nvenc" => Encoder::HevcNvenc,
+            _ => unimplemented!(),
+        })
+    }
+}
+
+impl Display for Encoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 pub fn extract_keyframes(file: &Path) -> anyhow::Result<Vec<Duration>> {
@@ -202,6 +365,7 @@ pub fn join_segments(
     file: &Path,
     segment_names: &[PathBuf],
     mut reencode: bool,
+    transcode_options: TranscodeOptions,
     estimated_duration: Duration,
     progress_sender: &Sender<ProcessingState>,
 ) -> anyhow::Result<PathBuf> {
@@ -223,6 +387,7 @@ pub fn join_segments(
         .args(["-nostats"])
         .args(["-loglevel", "warning"])
         .arg("-y")
+        .args(transcode_options.config_args())
         .args(["-analyzeduration", "100M"])
         .args(["-probesize", "100M"])
         .args(["-progress", "progress.txt"]);
@@ -257,9 +422,8 @@ pub fn join_segments(
     command.args(["-map", "0"]);
 
     if reencode {
-        command.args(["-c:v", "libx265"]);
-        command.args(["-crf", "26"]);
-        command.args(["-preset", "superfast"]);
+        command.args(["-c:a", "aac"]);
+        command.args(transcode_options.codec_args());
         command.args(["-max_muxing_queue_size", "9999"]);
 
         extension = "mp4";

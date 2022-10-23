@@ -15,7 +15,7 @@ use eframe::{
     epaint::{Color32, Stroke},
 };
 use egui_extras::{Size, StripBuilder, TableBuilder};
-use processing::ProcessingState;
+use processing::{ProcessingState, TranscodeOptions};
 use segment::Segment;
 use util::format_duration;
 use video_rpc::{get_player_info, send_command, PlayerCmd, PlayerInfo};
@@ -219,6 +219,8 @@ pub struct Gui {
     keyframes_thread: Option<JoinHandle<anyhow::Result<Vec<Duration>>>>,
 
     processing_updates: Option<watch::Receiver<ProcessingState>>,
+
+    transcode_options: TranscodeOptions,
 }
 
 impl Gui {
@@ -241,6 +243,7 @@ impl Gui {
             keyframes_thread: None,
 
             processing_updates: None,
+            transcode_options: TranscodeOptions::default(),
         }
     }
 
@@ -676,8 +679,6 @@ impl Gui {
     }
 
     fn draw_bottom_bar(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-
         ui.horizontal(|ui| {
             let mut encoding_enabled = ui
                 .ctx()
@@ -705,6 +706,8 @@ impl Gui {
                     .data()
                     .insert_persisted(Id::new("encoding_enabled"), encoding_enabled);
             }
+
+            ui.add_space(10.0);
 
             if let Some(update) = &self.processing_updates.as_mut().map(|up| up.get()) {
                 let (percentage, text) = match update {
@@ -751,6 +754,8 @@ impl Gui {
                     .text(text.as_ref())
                     .animate(true)
                     .ui(ui);
+            } else if encoding_enabled {
+                self.transcode_options.draw(ui);
             }
         });
     }
@@ -777,9 +782,10 @@ impl Gui {
 
         let (tx, rx) = watch::channel(ProcessingState::Starting);
         self.processing_updates = Some(rx);
+        let options = self.transcode_options;
 
         std::thread::spawn(move || {
-            Self::process_thread(file, segments, encode, tx, estimated_duration);
+            Self::process_thread(file, segments, encode, options, tx, estimated_duration);
         });
     }
 
@@ -787,6 +793,7 @@ impl Gui {
         file: PathBuf,
         segments: Vec<Segment>,
         encode: bool,
+        options: TranscodeOptions,
         tx: Sender<ProcessingState>,
         estimated_duration: Duration,
     ) {
@@ -823,9 +830,14 @@ impl Gui {
             return;
         }
 
-        if let Err(e) =
-            processing::join_segments(&file, &segment_names, encode, estimated_duration, &tx)
-        {
+        if let Err(e) = processing::join_segments(
+            &file,
+            &segment_names,
+            encode,
+            options,
+            estimated_duration,
+            &tx,
+        ) {
             eprintln!("Failed to join segments: {:?}", e);
             tx.send(ProcessingState::Failed);
             processing::cleanup(&file, &segment_names);
@@ -932,26 +944,25 @@ impl eframe::App for Gui {
 
             if !self.keyframes.is_empty() {
                 StripBuilder::new(ui)
+                    .size(Size::initial(25.0))
                     .size(Size::remainder())
                     .size(Size::relative(0.15))
-                    .size(Size::exact(25.0))
                     .vertical(|mut strip| {
+                        strip.cell(|ui| self.draw_bottom_bar(ui));
                         strip.cell(|ui| self.draw_table(ui));
                         strip.cell(|ui| self.draw_timeline(ui));
-                        strip.cell(|ui| self.draw_bottom_bar(ui));
                     });
             } else {
                 StripBuilder::new(ui)
-                    .size(Size::remainder())
                     .size(Size::exact(25.0))
+                    .size(Size::remainder())
                     .vertical(|mut strip| {
+                        strip.cell(|ui| self.draw_bottom_bar(ui));
                         strip.cell(|ui| {
                             ui.horizontal(|ui| {
                                 ui.label("Fetching keyframes...");
-                                ui.spinner();
                             });
                         });
-                        strip.cell(|ui| self.draw_bottom_bar(ui));
                     });
             }
         });
