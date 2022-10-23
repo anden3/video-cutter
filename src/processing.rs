@@ -248,7 +248,7 @@ pub fn extract_keyframes(file: &Path) -> anyhow::Result<Vec<Duration>> {
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .filter_map(extract_timestamp)
-        .map(parse_duration)
+        .filter_map(parse_duration)
         .collect();
 
     KEYFRAME_CACHE.with(|cache| {
@@ -263,17 +263,16 @@ fn extract_timestamp(line: &str) -> Option<&str> {
     line.split('\\').find(|l| *l != "N/A" && !l.is_empty())
 }
 
-fn parse_duration(input: &str) -> Duration {
-    let (input, micros) = input
-        .split_once('.')
-        .map(|(s, m)| {
-            (
-                s,
-                m.parse::<u32>()
-                    .unwrap_or_else(|_| panic!("Failure to parse duration: {}", input)),
-            )
+fn parse_duration(input: &str) -> Option<Duration> {
+    let (input, micros) = input.split_once('.').unwrap_or((input, "0"));
+
+    let micros = micros
+        .parse::<u32>()
+        .map_err(|e| {
+            eprintln!("Failure to parse duration: `{input}` due to {e}");
+            e
         })
-        .unwrap_or((input, 0));
+        .ok()?;
 
     let seconds = input
         .rsplit(':')
@@ -281,7 +280,7 @@ fn parse_duration(input: &str) -> Duration {
         .map(|(i, s)| s.parse::<usize>().unwrap() * (60usize.pow(i as _)))
         .sum::<usize>();
 
-    Duration::new(seconds as u64, micros * 1000)
+    Some(Duration::new(seconds as u64, micros * 1000))
 }
 
 pub fn cut_into_segments(file: &Path, segments: &[Segment]) -> anyhow::Result<Vec<PathBuf>> {
@@ -520,7 +519,7 @@ pub fn join_segments(
                         break;
                     }
                     ("out_time", time) => {
-                        frame_time = Some(parse_duration(time));
+                        frame_time = parse_duration(time);
                     }
                     ("speed", speed) => {
                         encode_speed = Some(
