@@ -25,18 +25,18 @@ pub fn format_duration_human(duration: &Duration) -> String {
         duration.as_secs() % 60,
     ] {
         [0, 0, 0] => "0 seconds".to_string(),
-        [0, 0, s] => format!("{s} second{}", (s > 1).then(|| "s").unwrap_or_default()),
-        [0, m, 0] => format!("{m} minute{}", (m > 1).then(|| "s").unwrap_or_default()),
+        [0, 0, s] => format!("{s} second{}", (s > 1).then_some("s").unwrap_or_default()),
+        [0, m, 0] => format!("{m} minute{}", (m > 1).then_some("s").unwrap_or_default()),
         [0, m, s] => format!(
             "{m} minute{} and {s} second{}",
-            (m > 1).then(|| "s").unwrap_or_default(),
-            (s > 1).then(|| "s").unwrap_or_default()
+            (m > 1).then_some("s").unwrap_or_default(),
+            (s > 1).then_some("s").unwrap_or_default()
         ),
-        [h, 0, _] => format!("{h} hour{}", (h > 1).then(|| "s").unwrap_or_default(),),
+        [h, 0, _] => format!("{h} hour{}", (h > 1).then_some("s").unwrap_or_default(),),
         [h, m, _] => format!(
             "{h} hour{} and {m} minute{}",
-            (h > 1).then(|| "s").unwrap_or_default(),
-            (m > 1).then(|| "s").unwrap_or_default()
+            (h > 1).then_some("s").unwrap_or_default(),
+            (m > 1).then_some("s").unwrap_or_default()
         ),
     }
 }

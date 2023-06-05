@@ -286,7 +286,7 @@ pub fn extract_keyframes(
 
     let keyframe_iter = output
         .lines()
-        .filter_map(|line| line.ok())
+        .map_while(Result::ok)
         .filter(|l| !l.is_empty())
         .filter_map(extract_timestamp)
         .filter_map(|l| parse_duration(&l));
@@ -347,7 +347,6 @@ pub fn cut_into_segments(file: &Path, segments: &[Segment]) -> anyhow::Result<Ve
         .ok_or_else(|| anyhow!("Could not get extension from path: {}", file.display()))?;
 
     let segment_names: Vec<_> = (0..segments.len())
-        .into_iter()
         .map(|i| {
             format!(
                 "{}_{i:03}_{}.{extension}",
