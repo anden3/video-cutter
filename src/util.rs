@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::{
     egui::plot::{Polygon, Value, Values},
@@ -69,4 +69,23 @@ pub fn rect_into_polygon(rect: &Rect) -> Polygon {
         .map(|(x, y)| Value::new(x, y));
 
     Polygon::new(Values::from_values_iter(points))
+}
+
+pub fn probe_iterator<'a, T, It, Fn>(
+    iterator: It,
+    update_interval: Duration,
+    mut func: Fn,
+) -> impl Iterator<Item = T> + 'a
+where
+    It: Iterator<Item = T> + 'a,
+    Fn: FnMut(&T) + 'a,
+{
+    let mut last_probe = Instant::now();
+
+    iterator.inspect(move |val| {
+        if last_probe.elapsed() >= update_interval {
+            func(val);
+            last_probe = Instant::now();
+        }
+    })
 }

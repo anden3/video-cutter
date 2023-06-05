@@ -15,7 +15,7 @@ use eframe::{
     epaint::{Color32, Stroke},
 };
 use egui_extras::{Size, StripBuilder, TableBuilder};
-use processing::{ProcessingState, TranscodeOptions};
+use processing::{KeyframeExtractionProgress, ProcessingState, TranscodeOptions};
 use segment::Segment;
 use util::format_duration;
 use video_rpc::{get_player_info, send_command, PlayerCmd, PlayerInfo};
@@ -217,6 +217,7 @@ pub struct Gui {
 
     keyframes: Vec<Duration>,
     keyframes_thread: Option<JoinHandle<anyhow::Result<Vec<Duration>>>>,
+    keyframes_updates: Option<watch::Receiver<KeyframeExtractionProgress>>,
 
     processing_updates: Option<watch::Receiver<ProcessingState>>,
 
@@ -241,6 +242,7 @@ impl Gui {
 
             keyframes: Vec::new(),
             keyframes_thread: None,
+            keyframes_updates: None,
 
             processing_updates: None,
             transcode_options: TranscodeOptions::default(),
@@ -904,45 +906,77 @@ impl eframe::App for Gui {
                 };
 
                 if update_keyframes {
+                    let (progress_sender, progress_receiver) =
+                        watch::channel(KeyframeExtractionProgress::default());
+
                     let path = info.path.clone();
 
-                    let keyframes_thread =
-                        std::thread::spawn(move || processing::extract_keyframes(&path));
+                    let keyframes_thread = std::thread::spawn(move || {
+                        processing::extract_keyframes(&path, progress_sender)
+                    });
+
                     self.keyframes_thread = Some(keyframes_thread);
+                    self.keyframes_updates = Some(progress_receiver);
                 }
 
                 self.player_info = Some(info);
             }
 
-            if self
-                .keyframes_thread
-                .as_ref()
-                .map_or(false, |thread| thread.is_finished())
-            {
-                let thread = self.keyframes_thread.take().unwrap();
+            if let Some(thread) = self.keyframes_thread.as_ref() {
+                if thread.is_finished() {
+                    let thread = self.keyframes_thread.take().unwrap();
 
-                self.keyframes = match thread.join() {
-                    Ok(Ok(keyframes)) => keyframes,
-                    Ok(Err(e)) => {
-                        eprintln!("Failed to extract keyframes: {e:?}");
-                        Vec::new()
+                    self.keyframes = match thread.join() {
+                        Ok(Ok(keyframes)) => keyframes,
+                        Ok(Err(e)) => {
+                            eprintln!("Failed to extract keyframes: {e:?}");
+                            Vec::new()
+                        }
+                        Err(e) => {
+                            eprintln!("Keyframes thread panicked: {e:?}");
+                            Vec::new()
+                        }
+                    };
+
+                    if let Some(info) = &self.player_info {
+                        self.keyframes.push(info.duration);
                     }
-                    Err(e) => {
-                        eprintln!("Keyframes thread panicked: {e:?}");
-                        Vec::new()
+
+                    if !self.keyframes.is_empty() && self.keyframes[0] != Duration::ZERO {
+                        self.keyframes.insert(0, Duration::ZERO);
                     }
-                };
+                } else {
+                    let keyframe_progress = self
+                        .keyframes_updates
+                        .as_mut()
+                        .map(|p| p.get())
+                        .unwrap_or_default();
 
-                if let Some(info) = &self.player_info {
-                    self.keyframes.push(info.duration);
+                    StripBuilder::new(ui)
+                        .size(Size::exact(25.0))
+                        .size(Size::remainder())
+                        .vertical(|mut strip| {
+                            strip.cell(|ui| self.draw_bottom_bar(ui));
+                            strip.cell(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Fetching keyframes:");
+                                    ui.add_space(10.0);
+
+                                    let percentage = ui.ctx().animate_value_with_time(
+                                        Id::new("keyframe_percentage"),
+                                        keyframe_progress.progress,
+                                        0.5,
+                                    );
+
+                                    ProgressBar::new(percentage)
+                                        .show_percentage()
+                                        .animate(true)
+                                        .ui(ui);
+                                });
+                            });
+                        });
                 }
-
-                if !self.keyframes.is_empty() && self.keyframes[0] != Duration::ZERO {
-                    self.keyframes.insert(0, Duration::ZERO);
-                }
-            }
-
-            if !self.keyframes.is_empty() {
+            } else if !self.keyframes.is_empty() {
                 StripBuilder::new(ui)
                     .size(Size::initial(25.0))
                     .size(Size::remainder())
@@ -960,7 +994,7 @@ impl eframe::App for Gui {
                         strip.cell(|ui| self.draw_bottom_bar(ui));
                         strip.cell(|ui| {
                             ui.horizontal(|ui| {
-                                ui.label("Fetching keyframes...");
+                                ui.label("Waiting for video...");
                             });
                         });
                     });

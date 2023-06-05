@@ -19,7 +19,16 @@ use eframe::egui;
 use once_cell::unsync::Lazy;
 use strum::{EnumIter, IntoEnumIterator};
 
-use crate::{util::format_duration, watch::Sender, Segment};
+use crate::{
+    util::{format_duration, probe_iterator},
+    watch::Sender,
+    Segment,
+};
+
+#[derive(Copy, Clone, Debug, PartialEq, Default)]
+pub struct KeyframeExtractionProgress {
+    pub progress: f32,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum ProcessingState {
@@ -196,7 +205,37 @@ impl Display for Encoder {
     }
 }
 
-pub fn extract_keyframes(file: &Path) -> anyhow::Result<Vec<Duration>> {
+pub fn get_video_length(file: &Path) -> anyhow::Result<Duration> {
+    let file_str = file
+        .to_str()
+        .context("Could not convert file path to string")?;
+
+    let mut cmd = Command::new("ffprobe");
+
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    cmd.args(["-v", "quiet"])
+        .args(["-i", file_str])
+        .args(["-show_entries", "format=duration"])
+        .args(["-of", r#"csv=p=0"#]);
+
+    let output = cmd.output().context("Could not run `ffprobe`")?.stdout;
+
+    let output =
+        std::str::from_utf8(&output).context("`ffprobe` output contained invalid UTF-8.")?;
+
+    parse_duration(output).with_context(|| format!("Failed to parse video length: {output}"))
+}
+
+pub fn extract_keyframes(
+    file: &Path,
+    progress_sender: Sender<KeyframeExtractionProgress>,
+) -> anyhow::Result<Vec<Duration>> {
     thread_local! {
         static KEYFRAME_CACHE: Lazy<RefCell<lru::LruCache<String, Vec<Duration>>>> =
             Lazy::new(|| RefCell::new(lru::LruCache::new(8)));
@@ -215,6 +254,8 @@ pub fn extract_keyframes(file: &Path) -> anyhow::Result<Vec<Duration>> {
         return Ok(keyframes);
     }
 
+    let video_duration = get_video_length(file)?;
+
     let mut cmd = Command::new("ffprobe");
 
     #[cfg(windows)]
@@ -232,24 +273,30 @@ pub fn extract_keyframes(file: &Path) -> anyhow::Result<Vec<Duration>> {
         ])
         .args(["-select_streams", "v"])
         .args(["-of", r#"csv=p=0:s=\"#])
-        .arg(file.to_str().unwrap());
+        .arg(file_str);
 
-    let output = cmd.output().context("Could not run `ffprobe`")?;
-
-    let lines = output
+    let output = cmd
+        .stdout(Stdio::piped())
+        .spawn()
+        .context("Could not run `ffprobe`")?
         .stdout
-        .split(|b| *b == b'\n')
-        .map(std::str::from_utf8)
-        .collect::<Result<Vec<_>, _>>()
-        .context("`ffprobe` output contained invalid UTF-8.")?;
+        .context("Could not capture standard output.")?;
 
-    let keyframes: Vec<Duration> = lines
-        .into_iter()
-        .map(|l| l.trim())
+    let output = BufReader::new(output);
+
+    let keyframe_iter = output
+        .lines()
+        .filter_map(|line| line.ok())
         .filter(|l| !l.is_empty())
         .filter_map(extract_timestamp)
-        .filter_map(parse_duration)
-        .collect();
+        .filter_map(|l| parse_duration(&l));
+
+    let keyframe_iter = probe_iterator(keyframe_iter, Duration::from_secs_f32(0.5), |keyframe| {
+        let progress = keyframe.as_secs_f32() / video_duration.as_secs_f32();
+        progress_sender.send(KeyframeExtractionProgress { progress });
+    });
+
+    let keyframes: Vec<Duration> = keyframe_iter.collect();
 
     KEYFRAME_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
@@ -259,12 +306,15 @@ pub fn extract_keyframes(file: &Path) -> anyhow::Result<Vec<Duration>> {
     Ok(keyframes)
 }
 
-fn extract_timestamp(line: &str) -> Option<&str> {
-    line.split('\\').find(|l| *l != "N/A" && !l.is_empty())
+fn extract_timestamp(line: String) -> Option<String> {
+    line.trim()
+        .split('\\')
+        .find(|l| *l != "N/A" && !l.is_empty())
+        .map(|s| s.to_owned())
 }
 
 fn parse_duration(input: &str) -> Option<Duration> {
-    let (input, micros) = input.split_once('.').unwrap_or((input, "0"));
+    let (input, micros) = input.trim().split_once('.').unwrap_or((input, "0"));
 
     let micros = micros
         .parse::<u32>()
