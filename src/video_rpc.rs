@@ -61,12 +61,15 @@ impl FromStr for PlayerInfo {
             .and_then(|s| s.strip_suffix(')'))
             .ok_or_else(|| anyhow::anyhow!("invalid format: {s}"))?;
 
-        match s
-            .split(',')
-            .map(|s| s.trim())
-            .collect::<Vec<_>>()
-            .as_slice()
-        {
+        let mut args = shell_words::split(s)?;
+
+        for arg in args.iter_mut() {
+            if arg.ends_with(',') {
+                arg.truncate(arg.len() - 1);
+            }
+        }
+
+        match args.as_slice() {
             [_, _, position, _, duration, _, _, _, path] => Ok(Self {
                 path: PathBuf::from(path.trim_matches('"')),
                 position: Duration::from_millis(position.parse()?),
