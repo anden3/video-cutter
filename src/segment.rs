@@ -15,6 +15,7 @@ use crate::{
 pub struct Segment {
     pub duration: Range<Duration>,
     pub description: String,
+    #[serde(default, skip_serializing)]
     pub path: PathBuf,
 }
 
